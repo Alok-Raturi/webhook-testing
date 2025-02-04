@@ -15,11 +15,13 @@ pipeline {
         }
         stage('Check for changes in vnet directory'){
             steps{
-                def changes = sh(script: 'git diff --name-only HEAD^ HEAD', returnStdout: true).trim()
-                if (!changes.contains('resources/bicep-templates/vnet/')) {
-                    currentBuild.result = 'SUCCESS'
-                    success("No changes in specific-directory; aborting build.")
-                    return;
+                script{
+                    def changes = sh(script: 'git diff --name-only HEAD^ HEAD', returnStdout: true).trim()
+                    if (!changes.contains('resources/bicep-templates/vnet/')) {
+                        currentBuild.result = 'SUCCESS'
+                        success("No changes in specific-directory; aborting build.")
+                        return;
+                    }
                 }
             }
         }
