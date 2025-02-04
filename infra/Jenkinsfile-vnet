@@ -1,0 +1,176 @@
+pipeline {
+    agent  {
+        docker {
+            image 'ubuntu'
+            args '-u 0'
+        }
+    }
+    stages {
+        stage('git checkout') {
+            steps{
+                script {
+                    git branch: 'alok', url: 'https://github.com/J007acky/aks-task.git'
+                }
+            }
+        }
+        stage('Check for changes in vnet directory'){
+            steps{
+                def changes = sh(script: 'git diff --name-only HEAD^ HEAD', returnStdout: true).trim()
+                if (!changes.contains('resources/bicep-templates/vnet/')) {
+                    currentBuild.result = 'SUCCESS'
+                    success("No changes in specific-directory; aborting build.")
+                    return;
+                }
+            }
+        }
+        stage('installation'){
+            steps{
+                script{
+                    sh '''
+                    echo 'nameserver 8.8.8.8'>/etc/resolv.conf
+                    '''
+                    sh 'apt-get update'
+                    sh 'apt-get upgrade -y'
+                    sh 'apt install curl -y'
+                    sh 'apt install libicu-dev -y'
+                    sh 'curl -sL https://aka.ms/InstallAzureCLIDeb | bash'
+                }
+            }
+        }
+        stage('az login'){
+            steps {
+                script {
+                    withCredentials([azureServicePrincipal(credentialsId:'AZ_CLI',subscriptionIdVariable: 'AZURE_SUBSCRIPTION_ID',clientIdVariable: 'AZURE_CLIENT_ID',clientSecretVariable: 'AZURE_CLIENT_SECRET',tenantIdVariable: 'AZURE_TENANT_ID')]) { 
+                        sh '''
+                            az login --service-principal --username ${AZURE_CLIENT_ID} --password ${AZURE_CLIENT_SECRET}  --tenant ${AZURE_TENANT_ID}
+                        '''
+                    }
+                    sh '''
+                        az bicep install
+                        az bicep upgrade
+                    '''
+                }
+            }
+        }
+        stage('Create Resource Groups'){
+            steps{
+                dir('resources/bicep-templates/vnet'){
+                    script{
+                        sh '''
+                        az deployment sub create --template-file resource-groups-vnet-and-resources.bicep --name resource-group-deployment --location 'East US'
+                        '''
+                        env.SHARED_VNET_RG_NAME= sh (script:'''
+                        az deployment sub show --name resource-group-deployment --query properties.outputs.sharedVnetRgName.value --output tsv
+                        ''',returnStdout:true)
+
+                        env.RESOURCE_VNET_RG_NAME= sh (script:'''
+                        az deployment sub show --name resource-group-deployment --query properties.outputs.resourceVnetRg.value --output tsv
+                        ''',returnStdout:true)
+                    }
+                }
+            }
+        }
+        stage('Shared VNet Configuration and Resource Deployment'){
+            steps{
+                dir('resources/bicep-templates/vnet'){
+                    script{
+                        sh '''
+                        az deployment group create --resource-group $SHARED_VNET_RG_NAME --template-file shared-vnet-configuration.bicep --name shared-vnet-configuration
+                        '''
+
+                        env.BASTION_SUBNET_ID_SHARED_VNET= sh (script:'''
+                        az deployment group show --name shared-vnet-configuration --resource-group $SHARED_VNET_RG_NAME --query properties.outputs.bastionSubnetSharedVnetId.value --output tsv
+                        ''',returnStdout:true)
+
+                        env.PRIVATE_SUBNET_ID_SHARED_VNET= sh (script:'''
+                        az deployment group show --name shared-vnet-configuration --resource-group $SHARED_VNET_RG_NAME --query properties.outputs.privateResourceSubnetSharedVnet.value --output tsv
+                        ''',returnStdout:true)
+                        
+                        env.PUBLIC_SUBNET_ID_SHARED_VNET= sh (script:'''
+                        az deployment group show --name shared-vnet-configuration --resource-group $SHARED_VNET_RG_NAME --query properties.outputs.publicResourceSubnetSharedVnet.value --output tsv
+                        ''',returnStdout:true)
+                        
+                        env.SHARED_VNET_NAME= sh (script:'''
+                        az deployment group show --name shared-vnet-configuration --resource-group $SHARED_VNET_RG_NAME --query properties.outputs.sharedVnetName.value --output tsv
+                        ''',returnStdout:true)
+                        
+                        env.SHARED_VNET_ID= sh (script:'''
+                        az deployment group show --name shared-vnet-configuration --resource-group $SHARED_VNET_RG_NAME --query properties.outputs.sharedVnetId.value --output tsv
+                        ''',returnStdout:true)
+
+                        sh '''
+                        az deployment group create --resource-group $SHARED_VNET_RG_NAME --template-file shared-vnet-resources.bicep --name shared-vnet-resources --parameters bastionSubnetId=$BASTION_SUBNET_ID_SHARED_VNET
+                        '''
+                    }
+                }
+            }
+        }
+        stage('Resource Vnet Configuration and Resource Deployment'){
+            steps{
+                dir('resources/bicep-templates/vnet'){
+                    script{
+                        sh '''
+                        az deployment group create --resource-group $RESOURCE_VNET_RG_NAME --template-file resource-vnet-configuration.bicep --name resource-vnet-configuration 
+                        '''
+
+                        env.RESOURCE_VNET_NAME= sh (script:'''
+                        az deployment group show --name resource-vnet-configuration  --resource-group $RESOURCE_VNET_RG_NAME --query properties.outputs.resourceVnetName.value --output tsv
+                        ''',returnStdout:true)
+
+                        sh '''
+                        echo $RESOURCE_VNET_NAME
+                        '''
+                    }
+                }
+            }
+        }
+        stage('Site to Site Setup'){
+            steps{
+                dir('resources/bicep-templates/vnet'){
+                    script{
+                        
+                        withCredentials([string(credentialsId: 'S2S-SECRET', variable: 'S2S-SECRET')]) {
+                            sh '''
+                            az deployment group create --resource-group $SHARED_VNET_RG_NAME --template-file s2s-vnet-setup.bicep --name 's2s-resource-setup' --parameters sharedVnetRg=$SHARED_VNET_RG_NAME resourceVnetRg=$RESOURCE_VNET_RG_NAME sharedVnetName=$SHARED_VNET_NAME resourceVnetName=$RESOURCE_VNET_NAME sharedKey=${S2S-SECRET} 
+                            '''
+                        }
+
+                        env.SHARED_VNG_NAME= sh (script:'''
+                        az deployment group show --name s2s-resource-setup --resource-group $SHARED_VNET_RG_NAME --query properties.outputs.sharedVngName.value --output tsv
+                        ''',returnStdout:true)
+
+                        env.RESOURCE_VNG_NAME= sh (script:'''
+                        az deployment group show --name s2s-resource-setup --resource-group $SHARED_VNET_RG_NAME --query properties.outputs.resourceVngName.value --output tsv
+                        ''',returnStdout:true)
+                    }
+                }
+            }
+        }
+        stage('Reset VNG after making connection'){
+            steps{
+                script{
+                    sh '''
+                    az network vnet-gateway reset -n $SHARED_VNG_NAME  -g $SHARED_VNET_RG_NAME
+                    '''
+                    sh '''
+                    az network vnet-gateway reset -n $RESOURCE_VNG_NAME -g $RESOURCE_VNET_RG_NAME
+                    '''
+                }
+            }
+        }
+        stage('az logout'){
+            steps{
+                script{
+                    sh '''
+                        az logout
+                    '''
+                }
+            }
+        }
+        stage('clear workspace'){
+            steps {
+                cleanWs()
+            }
+        }
+    }
+}
